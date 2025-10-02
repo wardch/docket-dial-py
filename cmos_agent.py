@@ -163,13 +163,28 @@ async def entrypoint(ctx: JobContext):
         - For address: Allow flexibility
         - Need 2 out of 3 to pass
 
-        TONE:
+        TONE & SPEECH STYLE:
         - Professional but not aggressive
-        - Clear and concise for phone calls
-        - Speak at moderate pace
+        - Sound natural and human-like with occasional fillers like "um", "uh", "let me just", "okay so", "right"
+        - Use ellipses (...) to create natural pauses for thinking or processing
+        - Use brief pauses when looking things up: "Let me just check that... okay"
+        - Occasionally use Irish conversational phrases: "Alright", "I see", "Perfect", "Grand", "there"
+        - Add natural hesitations at the start of sentences: "So...", "Right...", "Okay..."
+        - Don't sound robotic - vary your phrasing and add slight imperfections
         - Be empathetic but firm about payment
+        - Keep responses under 20 seconds for phone clarity
 
-        Keep responses under 20 seconds for phone clarity.""",
+        EXAMPLES OF NATURAL SPEECH WITH PAUSES:
+        - "Okay... let me just... pull that up for you there"
+        - "Right... so I have your account here"
+        - "Uh... just to verify - can you confirm your date of birth for me?"
+        - "Perfect... yeah that matches what we have"
+        - "I see... okay so... the balance is..."
+        - "Grand... let me just check that for you... okay"
+        - "Right... so just to confirm..."
+        - "Um... let me see here..."
+
+        Use these patterns naturally but don't overdo it - stay professional and conversational.""",
         tools=[verify_reference_number, verify_date_of_birth, verify_name, verify_address, get_account_balance]
     )
 
@@ -193,15 +208,24 @@ async def entrypoint(ctx: JobContext):
         # Large Language Model - GPT-4o-mini
         llm=openai.LLM(
             model="gpt-4o-mini",
-            temperature=0.7
+            temperature=0.7,
         ),
 
-        # Text-to-Speech - Cartesia Sonic-2
+
+        # voice="1463a4e1-56a1-4b41-b257-728d56e93605",  # Professional fancy male voice
+
+        # # Text-to-Speech - OpenAI TTS (fallback while Cartesia credits run out)
+        # tts=openai.TTS(
+        #     voice="alloy",  # Options: alloy, echo, fable, onyx, nova, shimmer
+        #     speed=0.95,
+        # )
+
+        # Text-to-Speech - Cartesia Sonic-2 (commented out - needs credits)
         tts=cartesia.TTS(
             model="sonic-2",
             voice="1463a4e1-56a1-4b41-b257-728d56e93605",  # Professional british male voice
             language="en",
-            speed=0.9,
+            speed=0.95,
             sample_rate=24000
         )
     )
@@ -209,10 +233,10 @@ async def entrypoint(ctx: JobContext):
     # Start the agent session
     await session.start(agent=agent, room=ctx.room)
 
-    # Initial greeting
+    # Initial greeting - more natural with pauses
     await session.generate_reply(
-        instructions="""Say: 'Hello, you're through to CMOS. For security purposes, can I take your reference number please?'
-        Speak professionally and clearly at a moderate pace."""
+        instructions="""Say: 'Hello... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?'
+        Use natural pauses (represented by ...) and speak conversationally."""
     )
 
 if __name__ == "__main__":
