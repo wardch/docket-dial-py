@@ -469,15 +469,10 @@ async def entrypoint(ctx: JobContext):
 
         # voice="1463a4e1-56a1-4b41-b257-728d56e93605",  # Professional fancy male voice
 
-        # # Text-to-Speech - OpenAI TTS (fallback while Cartesia credits run out)
-        # tts=openai.TTS(
-        #     voice="alloy",  # Options: alloy, echo, fable, onyx, nova, shimmer
-        #     speed=0.95,
-        # )
 
         # Text-to-Speech - Cartesia Sonic-2
         tts=cartesia.TTS(
-            model="sonic-2-2025-03-07",
+            model="sonic-2",
             voice="1463a4e1-56a1-4b41-b257-728d56e93605",  # Professional british male voice
             language="en",
             speed=0.95,
@@ -554,7 +549,7 @@ async def entrypoint(ctx: JobContext):
     await session.start(agent=agent, room=ctx.room)
 
     # Initial greeting - more natural with pauses
-    greeting = "Hello my name is Declan... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?"
+    greeting = "Hello there, how's it going, my name is Declan... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please whenever you're ready?"
     logger.info(f"{Colors.GREEN}🤖 AGENT: {greeting}{Colors.RESET}")
     await session.generate_reply(
         instructions=f"""Say: '{greeting}'
