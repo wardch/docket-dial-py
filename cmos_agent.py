@@ -14,6 +14,18 @@ from livekit.agents import (
 from livekit.plugins import deepgram, openai, cartesia, silero
 
 load_dotenv()
+
+# ANSI color codes for terminal output
+class Colors:
+    BLUE = '\033[94m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    MAGENTA = '\033[95m'
+    CYAN = '\033[96m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+
 logger = logging.getLogger("cmos-agent")
 
 # Global state to store account data for the current call
@@ -41,27 +53,53 @@ async def lookup_account(reference_number: str) -> dict:
             "debtorAddress": "89 Elm Row, Galway, H91 XY56"
         }
     }
-    logger.info(f"Looking up account for reference: {reference_number}")
+    logger.info(f"{Colors.CYAN}🔍 Looking up account for reference: {reference_number}{Colors.RESET}")
     return mock_data
 
 def normalize_date(date_str: str) -> str:
     """Normalize various date formats to YYYY-MM-DD."""
+    original_input = date_str
     date_str = date_str.lower().strip()
+
+    logger.info(f"{Colors.MAGENTA}📅 Normalizing date input: '{original_input}'{Colors.RESET}")
+
+    # Handle spoken number formats like "nineteen seventy five eleven twenty two"
+    # Convert to "1975 11 22"
+    number_words = {
+        'zero': '0', 'one': '1', 'two': '2', 'three': '3', 'four': '4',
+        'five': '5', 'six': '6', 'seven': '7', 'eight': '8', 'nine': '9',
+        'ten': '10', 'eleven': '11', 'twelve': '12', 'thirteen': '13',
+        'fourteen': '14', 'fifteen': '15', 'sixteen': '16', 'seventeen': '17',
+        'eighteen': '18', 'nineteen': '19', 'twenty': '20', 'thirty': '30',
+        'forty': '40', 'fifty': '50', 'sixty': '60', 'seventy': '70',
+        'eighty': '80', 'ninety': '90'
+    }
+
+    # Replace word numbers with digits
+    converted = date_str
+    for word, digit in number_words.items():
+        converted = converted.replace(word, digit)
+
+    logger.info(f"{Colors.MAGENTA}   ↳ After word-to-number conversion: '{converted}'{Colors.RESET}")
 
     # Common date formats to try
     formats = [
-        "%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y",
+        "%Y-%m-%d", "%Y %m %d", "%d/%m/%Y", "%m/%d/%Y", "%d-%m-%Y", "%m-%d-%Y",
         "%B %d %Y", "%d %B %Y", "%b %d %Y", "%d %b %Y",
-        "%B %d, %Y", "%d %B, %Y", "%b %d, %Y", "%d %b, %Y"
+        "%B %d, %Y", "%d %B, %Y", "%b %d, %Y", "%d %b, %Y",
+        "%d %m %Y", "%Y/%m/%d"
     ]
 
     for fmt in formats:
         try:
-            parsed_date = datetime.strptime(date_str, fmt)
-            return parsed_date.strftime("%Y-%m-%d")
+            parsed_date = datetime.strptime(converted, fmt)
+            normalized = parsed_date.strftime("%Y-%m-%d")
+            logger.info(f"{Colors.MAGENTA}   ✓ Successfully parsed as '{normalized}' using format '{fmt}'{Colors.RESET}")
+            return normalized
         except ValueError:
             continue
 
+    logger.warning(f"{Colors.YELLOW}⚠️  Could not parse date: '{original_input}' (converted: '{converted}'){Colors.RESET}")
     return date_str  # Return original if no match
 
 def name_similarity(name1: str, name2: str) -> float:
@@ -85,11 +123,18 @@ async def verify_date_of_birth(stated_dob: str) -> str:
     if not current_account:
         return "Error: No account loaded"
 
+    logger.info(f"{Colors.BLUE}{Colors.BOLD}🎂 DOB VERIFICATION{Colors.RESET}")
+    logger.info(f"{Colors.BLUE}   Stated: '{stated_dob}'{Colors.RESET}")
     normalized_dob = normalize_date(stated_dob)
     actual_dob = current_account["dateOfBirth"]
 
+    logger.info(f"{Colors.BLUE}   Comparison: '{normalized_dob}' vs '{actual_dob}'{Colors.RESET}")
+
     if normalized_dob == actual_dob:
+        logger.info(f"{Colors.GREEN}{Colors.BOLD}   ✅ DOB VERIFICATION: PASSED{Colors.RESET}")
         return "verified"
+
+    logger.warning(f"{Colors.RED}{Colors.BOLD}   ❌ DOB VERIFICATION: FAILED{Colors.RESET}")
     return "failed"
 
 @function_tool
@@ -111,15 +156,48 @@ async def verify_name(stated_name: str) -> str:
 @function_tool
 async def verify_address(stated_address: str) -> str:
     """Verify the caller's address. Returns 'verified' or 'failed'."""
+    import re
     global current_account
     if not current_account:
         return "Error: No account loaded"
 
     actual_address = current_account["debtorAddress"]
-    similarity = name_similarity(stated_address, actual_address)
+    logger.info(f"{Colors.CYAN}{Colors.BOLD}🏠 ADDRESS VERIFICATION{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}   Stated: '{stated_address}'{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}   On file: '{actual_address}'{Colors.RESET}")
+
+    # Normalize addresses for comparison - remove postcodes and extra punctuation
+    def normalize_address(addr: str) -> str:
+        # Convert to lowercase and remove common punctuation
+        addr = addr.lower().strip()
+        # Remove postcodes (common Irish format: H91 XY56 or similar)
+        addr = re.sub(r'\b[a-z]\d{2}\s*[a-z0-9]{4}\b', '', addr, flags=re.IGNORECASE)
+        # Remove extra punctuation and multiple spaces
+        addr = re.sub(r'[,.]', '', addr)
+        addr = re.sub(r'\s+', ' ', addr).strip()
+        return addr
+
+    normalized_stated = normalize_address(stated_address)
+    normalized_actual = normalize_address(actual_address)
+
+    logger.info(f"{Colors.CYAN}   Normalized stated: '{normalized_stated}'{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}   Normalized actual: '{normalized_actual}'{Colors.RESET}")
+
+    # Check if the stated address is contained in the actual address or vice versa
+    # This handles partial address matches like "89 Elm Row, Galway" vs "89 Elm Row, Galway, H91 XY56"
+    if normalized_stated in normalized_actual or normalized_actual in normalized_stated:
+        logger.info(f"{Colors.GREEN}{Colors.BOLD}   ✅ ADDRESS VERIFICATION: PASSED (substring match){Colors.RESET}")
+        return "verified"
+
+    # Fall back to similarity matching
+    similarity = name_similarity(normalized_stated, normalized_actual)
+    logger.info(f"{Colors.CYAN}   Similarity score: {similarity:.2f}{Colors.RESET}")
 
     if similarity >= 0.7:  # Allow some flexibility for address
+        logger.info(f"{Colors.GREEN}{Colors.BOLD}   ✅ ADDRESS VERIFICATION: PASSED (similarity match){Colors.RESET}")
         return "verified"
+
+    logger.warning(f"{Colors.RED}{Colors.BOLD}   ❌ ADDRESS VERIFICATION: FAILED (similarity {similarity:.2f} < 0.7){Colors.RESET}")
     return "failed"
 
 @function_tool
@@ -139,7 +217,7 @@ async def entrypoint(ctx: JobContext):
 
     # Wait for participant (caller) to join
     participant = await ctx.wait_for_participant()
-    logger.info(f"CMOS call connected from participant: {participant.identity}")
+    logger.info(f"{Colors.GREEN}{Colors.BOLD}📞 CALL CONNECTED - Participant: {participant.identity}{Colors.RESET}")
 
     # Initialize the CMOS debt collection agent
     agent = Agent(
@@ -151,11 +229,18 @@ async def entrypoint(ctx: JobContext):
            - Date of birth (ask first, easiest)
            - Name (ask second if needed)
            - Address (ask only if still need verification)
-        3. Once verified, read account balance and client they owe
-        4. State: "We need payment of that in full today"
+        3. Once GDPR verified (2 of 3 passed), MUST call get_account_balance() tool and use the EXACT values returned
+        4. State the exact balance and client, then say: "We need payment of that in full today"
         5. Handle response:
            - If YES: "Great, we'll text you the payment details"
            - If NO: "That's unfortunate, but hopefully we can negotiate more in the future"
+
+        CRITICAL SECURITY RULE - NEVER REVEAL GDPR DATA:
+        - NEVER tell the caller what information you have on file
+        - NEVER ask confirming questions like "Can you confirm your name is John Murphy?"
+        - ALWAYS ask open questions: "What is your date of birth?", "What is the name on the account?", "What is your address?"
+        - ONLY after they answer should you say "That's correct" or "That doesn't match what we have"
+        - This is a security requirement - you must make them prove they know the information
 
         VERIFICATION RULES:
         - For dates: Accept any reasonable format (22nd November 1975, 22/11/75, etc.)
@@ -168,7 +253,7 @@ async def entrypoint(ctx: JobContext):
         - Sound natural and human-like with occasional fillers like "um", "uh", "let me just", "okay so", "right"
         - Use ellipses (...) to create natural pauses for thinking or processing
         - Use brief pauses when looking things up: "Let me just check that... okay"
-        - Occasionally use Irish conversational phrases: "Alright", "I see", "Perfect", "Grand", "there"
+        - Occasionally use Irish conversational phrases: "Alright", "I see", "Perfect", "there"
         - Add natural hesitations at the start of sentences: "So...", "Right...", "Okay..."
         - Don't sound robotic - vary your phrasing and add slight imperfections
         - Be empathetic but firm about payment
@@ -180,7 +265,7 @@ async def entrypoint(ctx: JobContext):
         - "Uh... just to verify - can you confirm your date of birth for me?"
         - "Perfect... yeah that matches what we have"
         - "I see... okay so... the balance is..."
-        - "Grand... let me just check that for you... okay"
+        - "Right... let me just check that for you... okay"
         - "Right... so just to confirm..."
         - "Um... let me see here..."
 
@@ -230,12 +315,23 @@ async def entrypoint(ctx: JobContext):
         )
     )
 
+    # Add event listeners for transcription logging
+    @session.on("user_speech_committed")
+    def on_user_speech(msg):  # type: ignore
+        logger.info(f"{Colors.YELLOW}👤 USER: {msg.message}{Colors.RESET}")
+
+    @session.on("agent_speech_committed")
+    def on_agent_speech(msg):  # type: ignore
+        logger.info(f"{Colors.GREEN}🤖 AGENT: {msg.message}{Colors.RESET}")
+
     # Start the agent session
     await session.start(agent=agent, room=ctx.room)
 
     # Initial greeting - more natural with pauses
+    greeting = "Hello... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?"
+    logger.info(f"{Colors.GREEN}🤖 AGENT: {greeting}{Colors.RESET}")
     await session.generate_reply(
-        instructions="""Say: 'Hello... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?'
+        instructions=f"""Say: '{greeting}'
         Use natural pauses (represented by ...) and speak conversationally."""
     )
 
