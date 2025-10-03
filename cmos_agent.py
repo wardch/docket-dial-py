@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import os
 from datetime import datetime
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
@@ -11,9 +12,14 @@ from livekit.agents import (
     cli,
     function_tool
 )
+from livekit import api, rtc
 from livekit.plugins import deepgram, openai, cartesia, silero
+import stripe
 
 load_dotenv()
+
+# Initialize Stripe
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")
 
 # ANSI color codes for terminal output
 class Colors:
@@ -30,6 +36,10 @@ logger = logging.getLogger("cmos-agent")
 
 # Global state to store account data for the current call
 current_account = None
+gdpr_verified = False
+payment_status = None
+current_room_name = None
+current_participant_identity = None
 
 # Mock API function to look up account by reference number
 async def lookup_account(reference_number: str) -> dict:
@@ -40,7 +50,7 @@ async def lookup_account(reference_number: str) -> dict:
         "data": {
             "accountId": "IW1003",
             "referenceNumber": reference_number,
-            "debtorName": "John Murphy",
+            "debtorName": "Jimmy Flanagan",
             "dateOfBirth": "1975-11-22",
             "balanceDue": 322.15,
             "client": {
@@ -211,6 +221,141 @@ async def get_account_balance() -> str:
     client = current_account["client"]["name"]
     return f"Balance: €{balance:.2f} owed to {client}"
 
+@function_tool
+async def initiate_payment(amount_euros: float) -> str:
+    """
+    Initiate a Stripe payment for the caller.
+
+    This creates a PaymentIntent for the specified amount.
+    For Twilio Pay integration, you'll need to:
+    1. Enable PCI Mode in Twilio Console
+    2. Install Stripe Connector in Twilio Console (Voice > Manage > Pay Connectors)
+    3. Connect your Stripe account to Twilio
+
+    Args:
+        amount_euros: The amount to charge in euros
+
+    Returns:
+        Status message for the agent
+    """
+    global current_account, payment_status
+
+    if not current_account:
+        return "Error: No account loaded"
+
+    try:
+        # Convert euros to cents (Stripe uses smallest currency unit)
+        amount_cents = int(amount_euros * 100)
+
+        logger.info(f"{Colors.MAGENTA}{Colors.BOLD}💳 CREATING PAYMENT INTENT{Colors.RESET}")
+        logger.info(f"{Colors.MAGENTA}   Amount: €{amount_euros:.2f} ({amount_cents} cents){Colors.RESET}")
+
+        # Create a PaymentIntent
+        payment_intent = stripe.PaymentIntent.create(
+            amount=amount_cents,
+            currency="eur",
+            metadata={
+                "account_id": current_account["accountId"],
+                "reference_number": current_account["referenceNumber"],
+                "debtor_name": current_account["debtorName"],
+                "client": current_account["client"]["name"]
+            },
+            description=f"Payment for {current_account['client']['name']} - Ref: {current_account['referenceNumber']}"
+        )
+
+        payment_status = {
+            "payment_intent_id": payment_intent.id,
+            "amount": amount_euros,
+            "status": "initiated"
+        }
+
+        logger.info(f"{Colors.GREEN}{Colors.BOLD}   ✅ PaymentIntent created: {payment_intent.id}{Colors.RESET}")
+        logger.info(f"{Colors.GREEN}   Status: {payment_intent.status}{Colors.RESET}")
+
+        return f"payment_initiated - PaymentIntent ID: {payment_intent.id}"
+
+    except stripe.error.StripeError as e:
+        logger.error(f"{Colors.RED}{Colors.BOLD}   ❌ STRIPE ERROR: {str(e)}{Colors.RESET}")
+        payment_status = {"status": "failed", "error": str(e)}
+        return f"payment_failed - {str(e)}"
+
+@function_tool
+async def check_payment_status(payment_intent_id: str) -> str:
+    """
+    Check the status of a payment.
+
+    Args:
+        payment_intent_id: The Stripe PaymentIntent ID to check
+
+    Returns:
+        Current status of the payment
+    """
+    try:
+        payment_intent = stripe.PaymentIntent.retrieve(payment_intent_id)
+
+        logger.info(f"{Colors.CYAN}🔍 PAYMENT STATUS CHECK{Colors.RESET}")
+        logger.info(f"{Colors.CYAN}   PaymentIntent: {payment_intent_id}{Colors.RESET}")
+        logger.info(f"{Colors.CYAN}   Status: {payment_intent.status}{Colors.RESET}")
+
+        return f"status: {payment_intent.status}"
+
+    except stripe.error.StripeError as e:
+        logger.error(f"{Colors.RED}❌ Error checking payment: {str(e)}{Colors.RESET}")
+        return f"error: {str(e)}"
+
+@function_tool
+async def transfer_to_person() -> str:
+    """
+    Transfer the caller to speak with a real person.
+
+    This should be called when the caller requests to speak with a person,
+    representative, human, or similar request.
+
+    Returns:
+        Status message indicating transfer is in progress
+    """
+    global current_room_name, current_participant_identity
+
+    logger.info(f"{Colors.MAGENTA}{Colors.BOLD}📞 CALL TRANSFER INITIATED{Colors.RESET}")
+    logger.info(f"{Colors.MAGENTA}   Transferring to: +12097638338{Colors.RESET}")
+
+    if not current_room_name or not current_participant_identity:
+        logger.error(f"{Colors.RED}❌ Missing room or participant info{Colors.RESET}")
+        return "transfer_failed - missing room/participant info"
+
+    try:
+        # Transfer to US number (Irish number requires Twilio geo permissions)
+        transfer_to_number = "tel:+12097638338"
+
+        logger.info(f"{Colors.CYAN}📋 Transfer Details:{Colors.RESET}")
+        logger.info(f"{Colors.CYAN}   Room: {current_room_name}{Colors.RESET}")
+        logger.info(f"{Colors.CYAN}   Participant: {current_participant_identity}{Colors.RESET}")
+        logger.info(f"{Colors.CYAN}   Transfer To: {transfer_to_number}{Colors.RESET}")
+
+        logger.info(f"{Colors.YELLOW}🔧 Creating TransferSIPParticipantRequest...{Colors.RESET}")
+        transfer_request = api.TransferSIPParticipantRequest(
+            participant_identity=current_participant_identity,
+            room_name=current_room_name,
+            transfer_to=transfer_to_number,
+            play_dialtone=False
+        )
+        logger.info(f"{Colors.GREEN}✓ Transfer request created{Colors.RESET}")
+
+        logger.info(f"{Colors.YELLOW}🔧 Initializing LiveKit API client...{Colors.RESET}")
+        async with api.LiveKitAPI() as livekit_api:
+            logger.info(f"{Colors.YELLOW}⏳ Sending transfer request to LiveKit API...{Colors.RESET}")
+            result = await livekit_api.sip.transfer_sip_participant(transfer_request)
+            logger.info(f"{Colors.GREEN}{Colors.BOLD}✅ Call transferred successfully{Colors.RESET}")
+            logger.info(f"{Colors.GREEN}   API Response: {result}{Colors.RESET}")
+            return "transfer_successful"
+
+    except Exception as e:
+        logger.error(f"{Colors.RED}{Colors.BOLD}❌ TRANSFER ERROR: {str(e)}{Colors.RESET}")
+        logger.error(f"{Colors.RED}   Error type: {type(e).__name__}{Colors.RESET}")
+        import traceback
+        logger.error(f"{Colors.RED}   Traceback: {traceback.format_exc()}{Colors.RESET}")
+        return f"transfer_failed - {str(e)}"
+
 async def entrypoint(ctx: JobContext):
     """Main entry point for CMOS debt collection telephony agent."""
     await ctx.connect()
@@ -219,9 +364,21 @@ async def entrypoint(ctx: JobContext):
     participant = await ctx.wait_for_participant()
     logger.info(f"{Colors.GREEN}{Colors.BOLD}📞 CALL CONNECTED - Participant: {participant.identity}{Colors.RESET}")
 
+    # Store room and participant info for potential transfer
+    global current_room_name, current_participant_identity
+    room_name = ctx.room.name
+    participant_identity = participant.identity
+    current_room_name = room_name
+    current_participant_identity = participant_identity
+
     # Initialize the CMOS debt collection agent
     agent = Agent(
         instructions="""You are a professional debt collection agent for CMOS (pronounced "Sea-moss").
+
+        IMPORTANT - TRANSFER TO PERSON:
+        If at ANY point during the call the caller asks to speak with a person, representative, human, supervisor,
+        manager, or makes any similar request, you MUST immediately call the transfer_to_person() tool.
+        Say something like "Of course, let me transfer you to someone who can help" and then call the tool.
 
         CALL FLOW:
         1. Ask for their reference number
@@ -231,8 +388,12 @@ async def entrypoint(ctx: JobContext):
            - Address (ask only if still need verification)
         3. Once GDPR verified (2 of 3 passed), MUST call get_account_balance() tool and use the EXACT values returned
         4. State the exact balance and client, then say: "We need payment of that in full today"
-        5. Handle response:
-           - If YES: "Great, we'll text you the payment details"
+        5. Handle payment response:
+           - If YES to pay now:
+             a) Call initiate_payment() tool with the full balance amount
+             b) Say: "I'm now going to securely collect your payment information over the phone. You'll be asked to enter your card details using your phone keypad. This is completely secure and PCI compliant."
+             c) Inform them: "Please have your card ready. You'll need to enter the card number, expiry date, and security code."
+             d) IMPORTANT: After saying this, tell them you're ready to start and that they should follow the prompts
            - If NO: "That's unfortunate, but hopefully we can negotiate more in the future"
 
         CRITICAL SECURITY RULE - NEVER REVEAL GDPR DATA:
@@ -270,7 +431,16 @@ async def entrypoint(ctx: JobContext):
         - "Um... let me see here..."
 
         Use these patterns naturally but don't overdo it - stay professional and conversational.""",
-        tools=[verify_reference_number, verify_date_of_birth, verify_name, verify_address, get_account_balance]
+        tools=[
+            verify_reference_number,
+            verify_date_of_birth,
+            verify_name,
+            verify_address,
+            get_account_balance,
+            initiate_payment,
+            check_payment_status,
+            transfer_to_person
+        ]
     )
 
     # Configure the voice processing pipeline optimized for telephony
@@ -305,9 +475,9 @@ async def entrypoint(ctx: JobContext):
         #     speed=0.95,
         # )
 
-        # Text-to-Speech - Cartesia Sonic-2 (commented out - needs credits)
+        # Text-to-Speech - Cartesia Sonic-2
         tts=cartesia.TTS(
-            model="sonic-2",
+            model="sonic-2-2025-03-07",
             voice="1463a4e1-56a1-4b41-b257-728d56e93605",  # Professional british male voice
             language="en",
             speed=0.95,
@@ -324,11 +494,67 @@ async def entrypoint(ctx: JobContext):
     def on_agent_speech(msg):  # type: ignore
         logger.info(f"{Colors.GREEN}🤖 AGENT: {msg.message}{Colors.RESET}")
 
+    @session.on("function_call_finished")
+    def on_function_call(event):  # type: ignore
+        logger.info(f"{Colors.BLUE}🔔 function_call_finished event: {event.function_name}{Colors.RESET}")
+        if event.function_name == "transfer_to_person":
+            logger.info(f"{Colors.MAGENTA}{Colors.BOLD}🔄 Executing call transfer...{Colors.RESET}")
+
+            async def do_transfer():
+                logger.info(f"{Colors.YELLOW}⚙️  Starting do_transfer() function...{Colors.RESET}")
+                try:
+                    transfer_to_number = "tel:+12097638338"
+
+                    logger.info(f"{Colors.CYAN}📋 Transfer Details:{Colors.RESET}")
+                    logger.info(f"{Colors.CYAN}   Room: {room_name}{Colors.RESET}")
+                    logger.info(f"{Colors.CYAN}   Participant: {participant_identity}{Colors.RESET}")
+                    logger.info(f"{Colors.CYAN}   Transfer To: {transfer_to_number}{Colors.RESET}")
+
+                    logger.info(f"{Colors.YELLOW}🔧 Creating TransferSIPParticipantRequest...{Colors.RESET}")
+                    transfer_request = api.TransferSIPParticipantRequest(
+                        participant_identity=participant_identity,
+                        room_name=room_name,
+                        transfer_to=transfer_to_number,
+                        play_dialtone=False
+                    )
+                    logger.info(f"{Colors.GREEN}✓ Transfer request created{Colors.RESET}")
+
+                    # Use context manager for proper API cleanup
+                    logger.info(f"{Colors.YELLOW}🔧 Initializing LiveKit API client...{Colors.RESET}")
+                    async with api.LiveKitAPI() as livekit_api:
+                        logger.info(f"{Colors.YELLOW}⏳ Sending transfer request to LiveKit API...{Colors.RESET}")
+                        result = await livekit_api.sip.transfer_sip_participant(transfer_request)
+                        logger.info(f"{Colors.GREEN}{Colors.BOLD}✅ Call transferred successfully{Colors.RESET}")
+                        logger.info(f"{Colors.GREEN}   API Response: {result}{Colors.RESET}")
+                except Exception as e:
+                    logger.error(f"{Colors.RED}{Colors.BOLD}❌ TRANSFER ERROR: {str(e)}{Colors.RESET}")
+                    logger.error(f"{Colors.RED}   Error type: {type(e).__name__}{Colors.RESET}")
+                    import traceback
+                    logger.error(f"{Colors.RED}   Traceback: {traceback.format_exc()}{Colors.RESET}")
+                finally:
+                    logger.info(f"{Colors.YELLOW}🏁 do_transfer() function completed{Colors.RESET}")
+
+            # Get the current event loop and create the task properly
+            try:
+                loop = asyncio.get_running_loop()
+                logger.info(f"{Colors.YELLOW}🔧 Got event loop, creating transfer task...{Colors.RESET}")
+                task = loop.create_task(do_transfer())
+
+                def handle_task_result(task):
+                    try:
+                        task.result()
+                    except Exception as e:
+                        logger.error(f"{Colors.RED}{Colors.BOLD}❌ TASK ERROR: {str(e)}{Colors.RESET}")
+
+                task.add_done_callback(handle_task_result)
+            except Exception as e:
+                logger.error(f"{Colors.RED}{Colors.BOLD}❌ Failed to create transfer task: {str(e)}{Colors.RESET}")
+
     # Start the agent session
     await session.start(agent=agent, room=ctx.room)
 
     # Initial greeting - more natural with pauses
-    greeting = "Hello... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?"
+    greeting = "Hello my name is Declan... you're through to Sea Moss. Uh... for security purposes, can I just take your reference number there please?"
     logger.info(f"{Colors.GREEN}🤖 AGENT: {greeting}{Colors.RESET}")
     await session.generate_reply(
         instructions=f"""Say: '{greeting}'
