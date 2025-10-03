@@ -15,6 +15,7 @@ from livekit.agents import (
 from livekit import api, rtc
 from livekit.plugins import deepgram, openai, cartesia, silero
 import stripe
+import httpx
 
 load_dotenv()
 
@@ -41,30 +42,37 @@ payment_status = None
 current_room_name = None
 current_participant_identity = None
 
-# Mock API function to look up account by reference number
 async def lookup_account(reference_number: str) -> dict:
-    """Mock API call to look up account information."""
-    # This is a mock response - in production, this would call a real API
-    mock_data = {
-        "success": True,
-        "data": {
-            "accountId": "IW1003",
-            "referenceNumber": reference_number,
-            "debtorName": "Jimmy Flanagan",
-            "dateOfBirth": "1975-11-22",
-            "balanceDue": 322.15,
-            "client": {
-                "id": "a37b560e-fbb4-4458-adbb-77ae7ddf0594",
-                "name": "Irish Water"
-            },
-            "phoneNumber": "+353872223344",
-            "notes": "Prefers SMS follow-up",
-            "status": "pending",
-            "debtorAddress": "89 Elm Row, Galway, H91 XY56"
-        }
-    }
+    """Look up account information from the CMOS API."""
     logger.info(f"{Colors.CYAN}🔍 Looking up account for reference: {reference_number}{Colors.RESET}")
-    return mock_data
+
+    try:
+        async with httpx.AsyncClient() as client:
+            url = f"https://docket-dial.vercel.app/api/clients/cmos/account-lookup?referenceNumber={reference_number}"
+            logger.info(f"{Colors.CYAN}   API URL: {url}{Colors.RESET}")
+
+            response = await client.get(url, timeout=10.0)
+            response.raise_for_status()
+
+            data = response.json()
+            logger.info(f"{Colors.GREEN}✅ Account found: {data.get('data', {}).get('debtorName', 'Unknown')}{Colors.RESET}")
+
+            return {
+                "success": True,
+                "data": data.get("data", {})
+            }
+    except httpx.HTTPStatusError as e:
+        logger.error(f"{Colors.RED}❌ HTTP Error {e.response.status_code}: {e.response.text}{Colors.RESET}")
+        return {
+            "success": False,
+            "error": f"Account not found or API error: {e.response.status_code}"
+        }
+    except Exception as e:
+        logger.error(f"{Colors.RED}❌ Error looking up account: {str(e)}{Colors.RESET}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
 
 def normalize_date(date_str: str) -> str:
     """Normalize various date formats to YYYY-MM-DD."""
@@ -118,13 +126,31 @@ def name_similarity(name1: str, name2: str) -> float:
 
 @function_tool
 async def verify_reference_number(reference_number: str) -> str:
-    """Look up and store account information by reference number. Returns account details if found."""
+    """
+    Look up and store account information by reference number.
+
+    IMPORTANT: Before calling this function, you MUST:
+    1. Ask the caller to confirm the reference number they stated
+    2. Repeat it back to them clearly
+    3. Wait for them to confirm it's correct
+    4. Only then call this function
+
+    Returns account details if found, or error message if not found.
+    """
     global current_account
+
+    logger.info(f"{Colors.BLUE}{Colors.BOLD}🔍 REFERENCE NUMBER LOOKUP{Colors.RESET}")
+    logger.info(f"{Colors.BLUE}   Reference: {reference_number}{Colors.RESET}")
+
     result = await lookup_account(reference_number)
+
     if result["success"]:
         current_account = result["data"]
-        return f"Account found. Name on file: {current_account['debtorName']}, DOB: {current_account['dateOfBirth']}"
-    return "Account not found"
+        logger.info(f"{Colors.GREEN}✅ Account loaded for: {current_account['debtorName']}{Colors.RESET}")
+        return f"account_found - Ready to proceed with GDPR verification"
+    else:
+        logger.warning(f"{Colors.RED}❌ Account lookup failed: {result.get('error', 'Unknown error')}{Colors.RESET}")
+        return f"account_not_found - {result.get('error', 'Please ask caller to verify reference number')}"
 
 @function_tool
 async def verify_date_of_birth(stated_dob: str) -> str:
@@ -212,14 +238,24 @@ async def verify_address(stated_address: str) -> str:
 
 @function_tool
 async def get_account_balance() -> str:
-    """Get the current account balance and client information."""
+    """
+    Get the current account balance and client information.
+
+    Returns the EXACT balance amount and client name that MUST be used when speaking to the caller.
+    DO NOT make up or modify these values - use them exactly as returned.
+    """
     global current_account
     if not current_account:
         return "Error: No account loaded"
 
     balance = current_account["balanceDue"]
     client = current_account["client"]["name"]
-    return f"Balance: €{balance:.2f} owed to {client}"
+
+    logger.info(f"{Colors.CYAN}{Colors.BOLD}💰 ACCOUNT BALANCE{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}   Balance: €{balance:.2f}{Colors.RESET}")
+    logger.info(f"{Colors.CYAN}   Client: {client}{Colors.RESET}")
+
+    return f"EXACT_BALANCE: €{balance:.2f} | EXACT_CLIENT_NAME: {client} | You MUST use these exact values when speaking."
 
 @function_tool
 async def initiate_payment(amount_euros: float) -> str:
@@ -382,15 +418,25 @@ async def entrypoint(ctx: JobContext):
 
         CALL FLOW:
         1. Ask for their reference number
-        2. Verify their identity with GDPR questions (need 2 of 3 correct):
+        2. CONFIRM the reference number by repeating it back: "Just to confirm, that's [reference number], is that correct?"
+        3. Once confirmed, call verify_reference_number() to look up their account
+        4. If account not found, politely ask them to double-check and try again
+        5. If account found, proceed to GDPR verification (need 2 of 3 correct):
            - Date of birth (ask first, easiest)
            - Name (ask second if needed)
            - Address (ask only if still need verification)
-        3. Once GDPR verified (2 of 3 passed), MUST call get_account_balance() tool and use the EXACT values returned
-        4. State the exact balance and client, then say: "We need payment of that in full today"
-        5. Handle payment response:
+        6. Once GDPR verified (2 of 3 passed), you MUST:
+           a) Call get_account_balance() tool
+           b) Parse the EXACT balance amount and client name from the response
+           c) Use ONLY those exact values when speaking - NEVER make up or guess amounts or names
+           d) Say something like: "Okay, so the balance on your account is €[EXACT_BALANCE] owed to [EXACT_CLIENT_NAME]. We need payment of that in full today."
+
+        CRITICAL: The balance comes from data.balanceDue (e.g., 487.5 means "four hundred and eighty seven euro fifty")
+        CRITICAL: The client name comes from data.client.name (NOT the debtor's name)
+
+        7. Handle payment response:
            - If YES to pay now:
-             a) Call initiate_payment() tool with the full balance amount
+             a) Call initiate_payment() tool with the EXACT full balance amount from data.balanceDue
              b) Say: "I'm now going to securely collect your payment information over the phone. You'll be asked to enter your card details using your phone keypad. This is completely secure and PCI compliant."
              c) Inform them: "Please have your card ready. You'll need to enter the card number, expiry date, and security code."
              d) IMPORTANT: After saying this, tell them you're ready to start and that they should follow the prompts
